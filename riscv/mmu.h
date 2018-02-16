@@ -81,6 +81,9 @@ public:
   // template for functions that load an aligned value from memory
   #define load_func(type) \
     inline type##_t load_##type(reg_t addr) { \
+      if( sst_func != NULL ){ \
+        (*sst_func)(addr,sizeof(type##_t),true,false,false,false,0); \
+      } \
       if (unlikely(addr & (sizeof(type##_t)-1))) \
         return misaligned_load(addr, sizeof(type##_t)); \
       reg_t vpn = addr >> PGSHIFT; \
@@ -115,6 +118,9 @@ public:
   // template for functions that store an aligned value to memory
   #define store_func(type) \
     void store_##type(reg_t addr, type##_t val) { \
+      if( sst_func != NULL ){ \
+        (*sst_func)(addr,sizeof(type##_t),false,true,false,false,0); \
+      } \
       if (unlikely(addr & (sizeof(type##_t)-1))) \
         return misaligned_store(addr, val, sizeof(type##_t)); \
       reg_t vpn = addr >> PGSHIFT; \
@@ -136,6 +142,9 @@ public:
   #define amo_func(type) \
     template<typename op> \
     type##_t amo_##type(reg_t addr, op f) { \
+      if( sst_func != NULL ){ \
+        (*sst_func)(addr,sizeof(type##_t),false,false,true,false,0); \
+      } \
       if (addr & (sizeof(type##_t)-1)) \
         throw trap_store_address_misaligned(addr); \
       try { \
@@ -238,6 +247,8 @@ public:
 
   void register_memtracer(memtracer_t*);
 
+  void set_sst_func( void *ptr );
+
 private:
   sim_t* sim;
   processor_t* proc;
@@ -309,6 +320,9 @@ private:
   bool check_triggers_store;
   // The exception describing a matched trigger, or NULL.
   trigger_matched_t *matched_trigger;
+
+  void (*sst_func)(uint64_t addr, uint32_t regLen, bool Read,
+                   bool Write, bool Atomic, bool Custom, uint32_t Code);
 
   friend class processor_t;
 };

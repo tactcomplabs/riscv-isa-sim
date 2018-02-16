@@ -40,6 +40,12 @@ public:
 
   debug_module_t debug_module;
 
+  void set_sst_func( void *ptr ){
+    for( unsigned i=0; i<procs.size(); i++ ){
+      procs[i]->set_sst_func(ptr);
+    }
+  }
+
 private:
   std::vector<std::pair<reg_t, mem_t*>> mems;
   mmu_t* debug_mmu;  // debug port into main memory
