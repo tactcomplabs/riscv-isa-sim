@@ -6,6 +6,7 @@
 #include "processor.h"
 #include "devices.h"
 #include "debug_module.h"
+#include "simif.h"
 #include <fesvr/htif.h>
 #include <fesvr/context.h>
 #include <vector>
@@ -16,13 +17,13 @@ class mmu_t;
 class remote_bitbang_t;
 
 // this class encapsulates the processors and memory in a RISC-V machine.
-class sim_t : public htif_t
+class sim_t : public htif_t, public simif_t
 {
 public:
   sim_t(const char* isa, size_t _nprocs,  bool halted, reg_t start_pc,
         std::vector<std::pair<reg_t, mem_t*>> mems,
         const std::vector<std::string>& args, const std::vector<int> hartids,
-        unsigned progsize);
+        unsigned progsize, unsigned max_bus_master_bits, bool require_authentication);
   ~sim_t();
 
   // run the simulation to completion
@@ -38,7 +39,8 @@ public:
   processor_t* get_core(size_t i) { return procs.at(i); }
   unsigned nprocs() const { return procs.size(); }
 
-  debug_module_t debug_module;
+  // Callback for processors to let the simulation know they were reset.
+  void proc_reset(unsigned id);
 
   void set_sst_func( void *ptr ){
     for( unsigned i=0; i<procs.size(); i++ ){
@@ -98,6 +100,7 @@ private:
 
   friend class processor_t;
   friend class mmu_t;
+  friend class debug_module_t;
 
   // htif
   friend void sim_thread_main(void*);
@@ -111,6 +114,12 @@ private:
   void write_chunk(addr_t taddr, size_t len, const void* src);
   size_t chunk_align() { return 8; }
   size_t chunk_max_size() { return 8; }
+
+public:
+  // Initialize this after procs, because in debug_module_t::reset() we
+  // enumerate processors, which segfaults if procs hasn't been initialized
+  // yet.
+  debug_module_t debug_module;
 };
 
 extern volatile bool ctrlc_pressed;

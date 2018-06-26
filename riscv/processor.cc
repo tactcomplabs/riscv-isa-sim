@@ -4,7 +4,7 @@
 #include "extension.h"
 #include "common.h"
 #include "config.h"
-#include "sim.h"
+#include "simif.h"
 #include "mmu.h"
 #include "disasm.h"
 #include <cinttypes>
@@ -19,7 +19,7 @@
 #undef STATE
 #define STATE state
 
-processor_t::processor_t(const char* isa, sim_t* sim, uint32_t id,
+processor_t::processor_t(const char* isa, simif_t* sim, uint32_t id,
         bool halt_on_reset)
   : debug(false), halt_request(false), sim(sim), ext(NULL), id(id),
   halt_on_reset(halt_on_reset), last_pc(1), executions(1)
@@ -64,10 +64,10 @@ void processor_t::parse_isa_string(const char* str)
   const char* all_subsets = "imafdqc";
 
   max_xlen = 64;
-  isa = reg_t(2) << 62;
+  state.misa = reg_t(2) << 62;
 
   if (strncmp(p, "rv32", 4) == 0)
-    max_xlen = 32, isa = reg_t(1) << 30, p += 4;
+    max_xlen = 32, state.misa = reg_t(1) << 30, p += 4;
   else if (strncmp(p, "rv64", 4) == 0)
     p += 4;
   else if (strncmp(p, "rv", 2) == 0)
@@ -83,11 +83,11 @@ void processor_t::parse_isa_string(const char* str)
   }
 
   isa_string = "rv" + std::to_string(max_xlen) + p;
-  isa |= 1L << ('s' - 'a'); // advertise support for supervisor mode
-  isa |= 1L << ('u' - 'a'); // advertise support for user mode
+  state.misa |= 1L << ('s' - 'a'); // advertise support for supervisor mode
+  state.misa |= 1L << ('u' - 'a'); // advertise support for user mode
 
   while (*p) {
-    isa |= 1L << (*p - 'a');
+    state.misa |= 1L << (*p - 'a');
 
     if (auto next = strchr(all_subsets, *p)) {
       all_subsets = next + 1;
@@ -112,12 +112,13 @@ void processor_t::parse_isa_string(const char* str)
   if (supports_extension('Q') && max_xlen < 64)
     bad_isa_string(str);
 
-  max_isa = isa;
+  max_isa = state.misa;
 }
 
-void state_t::reset()
+void state_t::reset(reg_t max_isa)
 {
   memset(this, 0, sizeof(*this));
+  misa = max_isa;
   prv = PRV_M;
   pc = DEFAULT_RSTVEC;
   load_reservation = -1;
@@ -146,13 +147,16 @@ void processor_t::set_histogram(bool value)
 
 void processor_t::reset()
 {
-  state.reset();
+  state.reset(max_isa);
   state.dcsr.halt = halt_on_reset;
   halt_on_reset = false;
   set_csr(CSR_MSTATUS, state.mstatus);
 
   if (ext)
     ext->reset(); // reset the extension
+
+  if (sim)
+    sim->proc_reset(id);
 }
 
 // Count number of contiguous 0 bits starting from the LSB.
@@ -435,17 +439,21 @@ void processor_t::set_csr(int which, reg_t val)
         state.satp = val & (SATP64_PPN | SATP64_MODE);
       break;
     }
-    case CSR_SEPC: state.sepc = val; break;
+    case CSR_SEPC: state.sepc = val & ~(reg_t)1; break;
     case CSR_STVEC: state.stvec = val >> 2 << 2; break;
     case CSR_SSCRATCH: state.sscratch = val; break;
     case CSR_SCAUSE: state.scause = val; break;
     case CSR_STVAL: state.stval = val; break;
-    case CSR_MEPC: state.mepc = val; break;
+    case CSR_MEPC: state.mepc = val & ~(reg_t)1; break;
     case CSR_MTVEC: state.mtvec = val & ~(reg_t)2; break;
     case CSR_MSCRATCH: state.mscratch = val; break;
     case CSR_MCAUSE: state.mcause = val; break;
     case CSR_MTVAL: state.mtval = val; break;
     case CSR_MISA: {
+      // the write is ignored if increasing IALIGN would misalign the PC
+      if (!(val & (1L << ('C' - 'A'))) && (state.pc & 2))
+        break;
+
       if (!(val & (1L << ('F' - 'A'))))
         val &= ~(1L << ('D' - 'A'));
 
@@ -458,7 +466,7 @@ void processor_t::set_csr(int which, reg_t val)
       mask |= 1L << ('C' - 'A');
       mask &= max_isa;
 
-      isa = (val & mask) | (isa & ~mask);
+      state.misa = (val & mask) | (state.misa & ~mask);
       break;
     }
     case CSR_TSELECT:
@@ -510,7 +518,7 @@ void processor_t::set_csr(int which, reg_t val)
       state.dcsr.halt = get_field(val, DCSR_HALT);
       break;
     case CSR_DPC:
-      state.dpc = val;
+      state.dpc = val & ~(reg_t)1;
       break;
     case CSR_DSCRATCH:
       state.dscratch = val;
@@ -565,6 +573,11 @@ reg_t processor_t::get_csr(int which)
     case CSR_MINSTRET:
     case CSR_MCYCLE:
       return state.minstret;
+    case CSR_INSTRETH:
+    case CSR_CYCLEH:
+      if (ctr_ok && xlen == 32)
+        return state.minstret >> 32;
+      break;
     case CSR_MINSTRETH:
     case CSR_MCYCLEH:
       if (xlen == 32)
@@ -583,7 +596,7 @@ reg_t processor_t::get_csr(int which)
     }
     case CSR_SIP: return state.mip & state.mideleg;
     case CSR_SIE: return state.mie & state.mideleg;
-    case CSR_SEPC: return state.sepc;
+    case CSR_SEPC: return state.sepc & pc_alignment_mask();
     case CSR_STVAL: return state.stval;
     case CSR_STVEC: return state.stvec;
     case CSR_SCAUSE:
@@ -598,11 +611,11 @@ reg_t processor_t::get_csr(int which)
     case CSR_MSTATUS: return state.mstatus;
     case CSR_MIP: return state.mip;
     case CSR_MIE: return state.mie;
-    case CSR_MEPC: return state.mepc;
+    case CSR_MEPC: return state.mepc & pc_alignment_mask();
     case CSR_MSCRATCH: return state.mscratch;
     case CSR_MCAUSE: return state.mcause;
     case CSR_MTVAL: return state.mtval;
-    case CSR_MISA: return isa;
+    case CSR_MISA: return state.misa;
     case CSR_MARCHID: return 0;
     case CSR_MIMPID: return 0;
     case CSR_MVENDORID: return 0;
@@ -659,7 +672,7 @@ reg_t processor_t::get_csr(int which)
         return v;
       }
     case CSR_DPC:
-      return state.dpc;
+      return state.dpc & pc_alignment_mask();
     case CSR_DSCRATCH:
       return state.dscratch;
   }
